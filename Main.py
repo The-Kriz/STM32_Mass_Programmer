@@ -8,6 +8,7 @@ from tkinter import ttk, filedialog, messagebox
 import time
 import queue
 
+# Configuration
 DEBUG_LOG = "stm32_programmer_debug.log"
 startup_flags = 0
 IMPORTANT_LINES = {
@@ -30,12 +31,38 @@ def log_debug(message):
     with open(DEBUG_LOG, "a") as f:
         f.write(f"[{timestamp}] {message}\n")
 
+def find_stm32_cli():
+    """Try to find STM32_Programmer_CLI in common locations"""
+    import shutil
+    
+    # First check if it's in PATH
+    if shutil.which("STM32_Programmer_CLI"):
+        return "STM32_Programmer_CLI"
+    
+    # Common installation paths to check
+    common_paths = [
+        r"C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe",
+        r"C:\Program Files (x86)\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe",
+    ]
+    
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+    
+    return None
+
 def detect_stlinks():
     global startup_flags
     log_debug("Starting ST-Link detection")
+
+    stm32_cli = find_stm32_cli()
+    if not stm32_cli:
+        log_debug("STM32_Programmer_CLI not found in PATH or common locations")
+        return []
+
     try:
         result = subprocess.run(
-            ["STM32_Programmer_CLI", "-l"],
+            [stm32_cli, "-l"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -65,7 +92,8 @@ def detect_stlinks():
                 probe["status"] = "Flashing"
                 continue
             try:
-                check_cmd = ["STM32_Programmer_CLI", "-c", "port=SWD", f"sn={sn}", "-ob", "displ"]
+                # FIX: Use the found stm32_cli path instead of hardcoded string
+                check_cmd = [stm32_cli, "-c", "port=SWD", f"sn={sn}", "-ob", "displ"]
                 result = subprocess.run(
                     check_cmd,
                     capture_output=True,
@@ -80,8 +108,11 @@ def detect_stlinks():
                         probe["device_id"] = device_id.group(1)
             except Exception as e:
                 log_debug(f"Connection check failed for {sn}: {str(e)}")
-
         return list(detected.values())
+    
+    except FileNotFoundError:
+        log_debug("STM32_Programmer_CLI not found in PATH")
+        return []
     except Exception as e:
         log_debug(f"Detection failed: {str(e)}")
         return []
@@ -92,6 +123,13 @@ def program_device_gui(stlink, firmware_path, loader_path, status_queue):
     start_times[sn] = datetime.now()
     log_debug(f"Starting programming for {sn}")
     
+    # FIX: Find the STM32 CLI path
+    stm32_cli = find_stm32_cli()
+    if not stm32_cli:
+        status_queue.put((sn, "❌ Error: STM32_Programmer_CLI not found"))
+        flashing_stlinks.discard(sn)
+        return
+    
     time_update_thread = threading.Thread(
         target=update_time_continuously,
         args=(sn, status_queue),
@@ -100,8 +138,9 @@ def program_device_gui(stlink, firmware_path, loader_path, status_queue):
     time_update_thread.start()
     
     try:
+        # FIX: Use the found stm32_cli path
         cmd = [
-            "STM32_Programmer_CLI",
+            stm32_cli,
             "-c", "port=SWD",
             "freq=4000",
             f"sn={sn}",
@@ -155,11 +194,13 @@ def launch_gui():
     status_queue = queue.Queue()
     device_widgets = {}
 
+    # File selection variables
     firmware_path = tk.StringVar()
     firmware_display = tk.StringVar(value="No file selected")
     loader_path = tk.StringVar()
     loader_display = tk.StringVar(value="No file selected")
 
+    # Create frames
     frame_firmware = ttk.Frame(root)
     frame_device = ttk.Frame(root)
 
@@ -189,30 +230,61 @@ def launch_gui():
 
     def refresh_devices():
         try:
+            # Check if STM32_Programmer_CLI is available
+            if not find_stm32_cli():
+                # Clear existing widgets
+                for widget in device_frame.winfo_children():
+                    widget.destroy()
+                
+                # Show error message
+                error_label = ttk.Label(
+                    device_frame, 
+                    text="""STM32CubeProgrammer not found in PATH!
+
+                            1. Install from: https://www.st.com/stm32cubeprog
+                            2. Add to PATH: 
+                            - Right-click This PC → Properties → Advanced system settings
+                            - Environment Variables → System Variables → Path → Edit
+                            - Add path to STM32CubeProgrammer\\bin folder
+                            3. Restart application""",
+                    foreground="red",
+                    justify="center"
+                )
+                error_label.pack(expand=True, pady=50)
+                return
+
+            # Clear existing device widgets
             for widget in device_frame.winfo_children():
                 widget.destroy()
 
+            # Create a frame for the top controls (firmware label and refresh button)
             top_frame = ttk.Frame(device_frame)
             top_frame.grid(row=0, column=0, columnspan=5, sticky='ew', pady=5)
 
+            # Show firmware filename at top
             ttk.Label(top_frame, 
                     text=f"Firmware: {firmware_display.get()}", 
                     font=('TkDefaultFont', 10)).pack(side='left', padx=5)
 
+            # Add refresh button on right
             refresh_btn = ttk.Button(top_frame, text="Refresh ST-Links", command=refresh_devices)
             refresh_btn.pack(side='right', padx=5)
             device_widgets['refresh_btn'] = refresh_btn
 
+            # Configure grid to expand horizontally
             for col in range(5):
                 device_frame.grid_columnconfigure(col, weight=1)
 
+            # Create headers (starting at row 1 now)
             headers = ["ST-Link Serial", "Device ID", "Status", "Time", "Action"]
             for col, text in enumerate(headers):
                 ttk.Label(device_frame, text=text, font=('TkDefaultFont', 10, 'bold'))\
                 .grid(row=1, column=col, padx=15, pady=5, sticky='ew') 
 
+            # Get current devices
             devices = detect_stlinks()
             
+            # Create device rows (starting at row 2 now)
             for row, dev in enumerate(devices, start=2):
                 sn = dev.get('sn', 'N/A')
                 device_id = dev.get('device_id', 'No target')
@@ -272,6 +344,7 @@ def launch_gui():
                 
             widgets = device_widgets[sn]
             
+            # Disable refresh button if it exists
             if device_widgets.get('refresh_btn'):
                 device_widgets['refresh_btn'].config(state='disabled')
                 
@@ -306,6 +379,7 @@ def launch_gui():
                             widgets['label'].config(foreground=color)
                             widgets['btn'].config(state="normal")
                             
+                            # Check if all uploads are complete
                             if not flashing_stlinks and device_widgets.get('refresh_btn'):
                                 device_widgets['refresh_btn'].config(state='normal')
                         else:
@@ -314,8 +388,10 @@ def launch_gui():
             pass
         root.after(200, update_gui)
 
+    # Firmware selection page
     frame_firmware.pack(fill='both', expand=True, padx=20, pady=20)
     
+    # Firmware selection box (top)
     firmware_box = ttk.LabelFrame(frame_firmware, text="Firmware Selection", padding=10)
     firmware_box.pack(fill='x', padx=5, pady=5)
     
@@ -323,6 +399,7 @@ def launch_gui():
     ttk.Button(firmware_box, text="Browse", command=browse_firmware).pack(pady=5)
     ttk.Label(firmware_box, textvariable=firmware_display, wraplength=400).pack(pady=5)
     
+    # Loader selection box (bottom)
     loader_box = ttk.LabelFrame(frame_firmware, text="Loader Selection", padding=10)
     loader_box.pack(fill='x', padx=5, pady=5)
     
@@ -330,8 +407,10 @@ def launch_gui():
     ttk.Button(loader_box, text="Browse", command=browse_loader).pack(pady=5)
     ttk.Label(loader_box, textvariable=loader_display, wraplength=400).pack(pady=5)
     
+    # Next button at the very bottom
     ttk.Button(frame_firmware, text="Next ➡", command=show_device_page).pack(pady=20)
 
+    # Device page
     device_frame = ttk.Frame(frame_device)
     device_frame.pack(fill='both', expand=True, padx=20, pady=10)
 
