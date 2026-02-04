@@ -8,7 +8,6 @@ from tkinter import ttk, filedialog, messagebox
 import time
 import queue
 
-# Configuration
 DEBUG_LOG = "stm32_programmer_debug.log"
 startup_flags = 0
 IMPORTANT_LINES = {
@@ -25,6 +24,8 @@ device_widgets = {
 }
 flashing_stlinks = set()
 start_times = {}
+device_flash_profile = {}
+
 
 def log_debug(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -32,14 +33,10 @@ def log_debug(message):
         f.write(f"[{timestamp}] {message}\n")
 
 def find_stm32_cli():
-    """Try to find STM32_Programmer_CLI in common locations"""
     import shutil
-    
-    # First check if it's in PATH
     if shutil.which("STM32_Programmer_CLI"):
         return "STM32_Programmer_CLI"
     
-    # Common installation paths to check
     common_paths = [
         r"C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe",
         r"C:\Program Files (x86)\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe",
@@ -92,7 +89,6 @@ def detect_stlinks():
                 probe["status"] = "Flashing"
                 continue
             try:
-                # FIX: Use the found stm32_cli path instead of hardcoded string
                 check_cmd = [stm32_cli, "-c", "port=SWD", f"sn={sn}", "-ob", "displ"]
                 result = subprocess.run(
                     check_cmd,
@@ -119,11 +115,11 @@ def detect_stlinks():
 
 def program_device_gui(stlink, firmware_path, loader_path, status_queue):
     sn = stlink["sn"]
+    device_id = stlink.get("device_id")
     flashing_stlinks.add(sn)
     start_times[sn] = datetime.now()
     log_debug(f"Starting programming for {sn}")
     
-    # FIX: Find the STM32 CLI path
     stm32_cli = find_stm32_cli()
     if not stm32_cli:
         status_queue.put((sn, "❌ Error: STM32_Programmer_CLI not found"))
@@ -137,43 +133,69 @@ def program_device_gui(stlink, firmware_path, loader_path, status_queue):
     )
     time_update_thread.start()
     
+    profile = device_flash_profile.get(device_id)
+
+    if profile:
+        FLASH_ATTEMPTS = [profile]
+    else:
+        FLASH_ATTEMPTS = [
+            {"ap": None, "freq": 4000, "mode": "Normal"},
+            {"ap": 0,    "freq": 4000, "mode": "Normal"},
+            {"ap": 1,    "freq": 4000, "mode": "Normal"},
+            {"ap": None, "freq": 1000, "mode": "UnderReset"},
+    ]
+
     try:
-        # FIX: Use the found stm32_cli path
-        cmd = [
-            stm32_cli,
-            "-c", "port=SWD",
-            "freq=4000",
-            f"sn={sn}",
-            "mode=Normal",
-            "ap=1",
-            "speed=Reliable",
-            "-w", firmware_path,
-            "-v",
-            "-el", loader_path,
-            "-rst"
-        ]
+        success = False
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            creationflags=startup_flags
-        )
+        for attempt in FLASH_ATTEMPTS:
+            cmd = [
+                stm32_cli,
+                "-c", "port=SWD",
+                f"freq={attempt['freq']}",
+                f"sn={sn}",
+                f"mode={attempt['mode']}",
+            ]
 
-        for line in process.stdout:
-            log_debug(f"{sn[-4:]}: {line.strip()}")
-            for key, label in IMPORTANT_LINES.items():
-                if key in line and label:
-                    status_queue.put((sn, label))
-                    break
+            if attempt["ap"] is not None:
+                cmd.append(f"ap={attempt['ap']}")
 
-        process.wait()
-        if process.returncode == 0:
+            if loader_path and attempt["ap"] == 1:
+                cmd.extend(["-el", loader_path])
+
+            cmd.extend(["-w", firmware_path, "-v", "-rst"])
+
+            log_debug(f"Trying flash: {cmd}")
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=startup_flags
+            )
+
+            for line in process.stdout:
+                log_debug(f"{sn[-4:]}: {line.strip()}")
+                for key, label in IMPORTANT_LINES.items():
+                    if key in line and label:
+                        status_queue.put((sn, label))
+                        break
+
+            process.wait()
+
+            if process.returncode == 0 and device_id:
+                device_flash_profile[device_id] = attempt
+                log_debug(f"Device {sn} ({device_id}) programmed successfully using {attempt}")
+                success = True
+                break
+
+        if success:
             status_queue.put((sn, "✅ Completed"))
         else:
             status_queue.put((sn, "❌ Failed"))
+
 
     except Exception as e:
         status_queue.put((sn, f"❌ Error: {str(e)}"))
@@ -194,13 +216,12 @@ def launch_gui():
     status_queue = queue.Queue()
     device_widgets = {}
 
-    # File selection variables
     firmware_path = tk.StringVar()
     firmware_display = tk.StringVar(value="No file selected")
     loader_path = tk.StringVar()
     loader_display = tk.StringVar(value="No file selected")
+    use_loader = tk.BooleanVar(value=True)
 
-    # Create frames
     frame_firmware = ttk.Frame(root)
     frame_device = ttk.Frame(root)
 
@@ -211,7 +232,11 @@ def launch_gui():
             firmware_display.set(os.path.basename(path))
 
     def browse_loader():
-        path = filedialog.askopenfilename(filetypes=[("Loader files", "*.stldr"), ("All files", "*.*")])
+        if not use_loader.get():
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[("Loader files", "*.stldr"), ("All files", "*.*")]
+        )
         if path:
             loader_path.set(path)
             loader_display.set(os.path.basename(path))
@@ -219,24 +244,24 @@ def launch_gui():
     def show_device_page():
         if not firmware_path.get():
             messagebox.showwarning("Warning", "Please select a firmware file")
+            return           
+        if use_loader.get() and not loader_path.get():
+            messagebox.showwarning(
+                "Warning",
+                "External loader is enabled but no loader file is selected"
+            )
             return
-        if not loader_path.get():
-            messagebox.showwarning("Warning", "Please select a loader file")
-            return
-            
+
         frame_firmware.pack_forget()
         frame_device.pack(fill='both', expand=True)
         refresh_devices()
 
     def refresh_devices():
         try:
-            # Check if STM32_Programmer_CLI is available
             if not find_stm32_cli():
-                # Clear existing widgets
                 for widget in device_frame.winfo_children():
                     widget.destroy()
                 
-                # Show error message
                 error_label = ttk.Label(
                     device_frame, 
                     text="""STM32CubeProgrammer not found in PATH!
@@ -253,48 +278,43 @@ def launch_gui():
                 error_label.pack(expand=True, pady=50)
                 return
 
-            # Clear existing device widgets
             for widget in device_frame.winfo_children():
                 widget.destroy()
 
-            # Create a frame for the top controls (firmware label and refresh button)
             top_frame = ttk.Frame(device_frame)
-            top_frame.grid(row=0, column=0, columnspan=5, sticky='ew', pady=5)
+            top_frame.grid(row=0, column=0, columnspan=6, sticky='ew', pady=5)
 
-            # Show firmware filename at top
             ttk.Label(top_frame, 
                     text=f"Firmware: {firmware_display.get()}", 
                     font=('TkDefaultFont', 10)).pack(side='left', padx=5)
 
-            # Add refresh button on right
             refresh_btn = ttk.Button(top_frame, text="Refresh ST-Links", command=refresh_devices)
             refresh_btn.pack(side='right', padx=5)
             device_widgets['refresh_btn'] = refresh_btn
 
-            # Configure grid to expand horizontally
-            for col in range(5):
+            for col in range(6):
                 device_frame.grid_columnconfigure(col, weight=1)
 
-            # Create headers (starting at row 1 now)
-            headers = ["ST-Link Serial", "Device ID", "Status", "Time", "Action"]
+            headers = ["ST-Link Serial", "Device ID", "AP Used", "Status", "Time", "Action"]
             for col, text in enumerate(headers):
                 ttk.Label(device_frame, text=text, font=('TkDefaultFont', 10, 'bold'))\
-                .grid(row=1, column=col, padx=15, pady=5, sticky='ew') 
+                .grid(row=1, column=col, padx=15, pady=5, sticky='ew')
 
-            # Get current devices
             devices = detect_stlinks()
             
-            # Create device rows (starting at row 2 now)
             for row, dev in enumerate(devices, start=2):
                 sn = dev.get('sn', 'N/A')
                 device_id = dev.get('device_id', 'No target')
-                
+                ap_used = dev.get('ap', '--')
+
                 ttk.Label(device_frame, text=sn).grid(row=row, column=0, sticky='ew', padx=15)
                 ttk.Label(device_frame, text=device_id).grid(row=row, column=1, sticky='ew', padx=15)
-                
+                ap_label = ttk.Label(device_frame, text=ap_used)
+                ap_label.grid(row=row, column=2, sticky='ew', padx=15)
+
                 status_var = tk.StringVar()
                 time_var = tk.StringVar()
-                
+
                 if sn in flashing_stlinks:
                     status = "Flashing..."
                     color = "blue"
@@ -307,30 +327,30 @@ def launch_gui():
                     status = "Not Connected"
                     color = "gray"
                     btn_state = "disabled"
-                
+
                 status_var.set(status)
                 time_var.set("0:00" if status == "Flashing..." else "--:--")
-                
+
                 status_label = ttk.Label(device_frame, textvariable=status_var, foreground=color)
-                status_label.grid(row=row, column=2, sticky='ew', padx=15)
-                
-                ttk.Label(device_frame, textvariable=time_var).grid(row=row, column=3, sticky='ew', padx=15)
-                
+                status_label.grid(row=row, column=3, sticky='ew', padx=15)
+                ttk.Label(device_frame, textvariable=time_var).grid(row=row, column=4, sticky='ew', padx=15)
                 btn = ttk.Button(device_frame, text="Upload", state=btn_state,
-                            command=lambda d=dev: upload_device(d))
-                btn.grid(row=row, column=4, sticky='ew', padx=15)
-                
+                                command=lambda d=dev: upload_device(d))
+                btn.grid(row=row, column=5, sticky='ew', padx=15)
+
                 device_widgets[sn] = {
                     'var': status_var,
                     'label': status_label,
                     'btn': btn,
                     'dev': dev,
-                    'time_var': time_var
+                    'time_var': time_var,
+                    'ap_label': ap_label
                 }
 
         except Exception as e:
             log_debug(f"Error in refresh_devices: {str(e)}")
             messagebox.showerror("Error", f"Failed to refresh devices: {str(e)}")
+
 
     def upload_device(dev):
         try:
@@ -344,7 +364,6 @@ def launch_gui():
                 
             widgets = device_widgets[sn]
             
-            # Disable refresh button if it exists
             if device_widgets.get('refresh_btn'):
                 device_widgets['refresh_btn'].config(state='disabled')
                 
@@ -355,10 +374,10 @@ def launch_gui():
             
             threading.Thread(
                 target=program_device_gui, 
-                args=(dev, firmware_path.get(), loader_path.get(), status_queue),
+                args=(dev, firmware_path.get(), loader_path.get() if use_loader.get() else None, status_queue),
                 daemon=True
             ).start()
-            
+
         except Exception as e:
             log_debug(f"Error in upload_device: {str(e)}")
             messagebox.showerror("Error", f"Upload failed: {str(e)}")
@@ -379,7 +398,6 @@ def launch_gui():
                             widgets['label'].config(foreground=color)
                             widgets['btn'].config(state="normal")
                             
-                            # Check if all uploads are complete
                             if not flashing_stlinks and device_widgets.get('refresh_btn'):
                                 device_widgets['refresh_btn'].config(state='normal')
                         else:
@@ -388,29 +406,26 @@ def launch_gui():
             pass
         root.after(200, update_gui)
 
-    # Firmware selection page
     frame_firmware.pack(fill='both', expand=True, padx=20, pady=20)
     
-    # Firmware selection box (top)
     firmware_box = ttk.LabelFrame(frame_firmware, text="Firmware Selection", padding=10)
     firmware_box.pack(fill='x', padx=5, pady=5)
     
     ttk.Label(firmware_box, text="Select HEX File:").pack(pady=5)
     ttk.Button(firmware_box, text="Browse", command=browse_firmware).pack(pady=5)
     ttk.Label(firmware_box, textvariable=firmware_display, wraplength=400).pack(pady=5)
-    
-    # Loader selection box (bottom)
+
     loader_box = ttk.LabelFrame(frame_firmware, text="Loader Selection", padding=10)
     loader_box.pack(fill='x', padx=5, pady=5)
     
     ttk.Label(loader_box, text="Select Loader File:").pack(pady=5)
     ttk.Button(loader_box, text="Browse", command=browse_loader).pack(pady=5)
     ttk.Label(loader_box, textvariable=loader_display, wraplength=400).pack(pady=5)
-    
-    # Next button at the very bottom
+
+    ttk.Checkbutton(loader_box, text="Use external loader",variable=use_loader).pack(pady=5)
+
     ttk.Button(frame_firmware, text="Next ➡", command=show_device_page).pack(pady=20)
 
-    # Device page
     device_frame = ttk.Frame(frame_device)
     device_frame.pack(fill='both', expand=True, padx=20, pady=10)
 
