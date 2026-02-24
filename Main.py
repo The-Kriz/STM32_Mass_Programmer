@@ -220,7 +220,7 @@ def launch_gui():
     firmware_display = tk.StringVar(value="No file selected")
     loader_path = tk.StringVar()
     loader_display = tk.StringVar(value="No file selected")
-    use_loader = tk.BooleanVar(value=True)
+    use_loader = tk.BooleanVar(value=False)
 
     frame_firmware = ttk.Frame(root)
     frame_device = ttk.Frame(root)
@@ -284,9 +284,13 @@ def launch_gui():
             top_frame = ttk.Frame(device_frame)
             top_frame.grid(row=0, column=0, columnspan=6, sticky='ew', pady=5)
 
-            ttk.Label(top_frame, 
-                    text=f"Firmware: {firmware_display.get()}", 
-                    font=('TkDefaultFont', 10)).pack(side='left', padx=5)
+            info_frame = ttk.Frame(top_frame)
+            info_frame.pack(side='left', padx=5)
+
+            ttk.Label(info_frame, text=f"Firmware: {firmware_display.get()}", font=('TkDefaultFont', 10)).pack(anchor='w')
+
+            if use_loader.get() and loader_path.get():
+                ttk.Label(info_frame, text=f"Loader: {os.path.basename(loader_path.get())}", font=('TkDefaultFont', 10)).pack(anchor='w')
 
             refresh_btn = ttk.Button(top_frame, text="Refresh ST-Links", command=refresh_devices)
             refresh_btn.pack(side='right', padx=5)
@@ -406,6 +410,18 @@ def launch_gui():
             pass
         root.after(200, update_gui)
 
+    def toggle_loader():
+        if use_loader.get():
+            loader_btn.config(state="normal")
+            loader_label_top.config(foreground="black")
+            loader_label_file.config(foreground="black")
+        else:
+            loader_btn.config(state="disabled")
+            loader_label_top.config(foreground="gray")
+            loader_label_file.config(foreground="gray")
+            loader_path.set("")
+            loader_display.set("No file selected")
+
     frame_firmware.pack(fill='both', expand=True, padx=20, pady=20)
     
     firmware_box = ttk.LabelFrame(frame_firmware, text="Firmware Selection", padding=10)
@@ -418,12 +434,18 @@ def launch_gui():
     loader_box = ttk.LabelFrame(frame_firmware, text="Loader Selection", padding=10)
     loader_box.pack(fill='x', padx=5, pady=5)
     
-    ttk.Label(loader_box, text="Select Loader File:").pack(pady=5)
-    ttk.Button(loader_box, text="Browse", command=browse_loader).pack(pady=5)
-    ttk.Label(loader_box, textvariable=loader_display, wraplength=400).pack(pady=5)
+    loader_label_top = ttk.Label(loader_box, text="Select Loader File:")
+    loader_label_top.pack(pady=5)
+    loader_btn = ttk.Button(loader_box, text="Browse", command=browse_loader)
+    loader_btn.pack(pady=5)
+    loader_label_file = ttk.Label(loader_box, textvariable=loader_display, wraplength=400)
+    loader_label_file.pack(pady=5)
 
-    ttk.Checkbutton(loader_box, text="Use external loader",variable=use_loader).pack(pady=5)
+    loader_btn.config(state="disabled")
+    loader_label_top.config(foreground="gray")
+    loader_label_file.config(foreground="gray")
 
+    ttk.Checkbutton(loader_box, text="Use Loader File", variable=use_loader, command=toggle_loader).pack(pady=5)
     ttk.Button(frame_firmware, text="Next ➡", command=show_device_page).pack(pady=20)
 
     device_frame = ttk.Frame(frame_device)
